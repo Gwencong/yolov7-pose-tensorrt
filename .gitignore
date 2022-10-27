@@ -5,6 +5,7 @@ caches
 runs
 data
 deploy
+weights
 
 *.engine
 *.trt
