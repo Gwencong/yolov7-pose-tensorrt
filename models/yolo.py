@@ -213,8 +213,10 @@ class IDetect(nn.Module):
 
 
 class IKeypoint(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
+    stride   = None   # strides computed during build
+    export   = False  # onnx export
+    dynamic  = False  # onnx dynamic
+    end2end  = False  # export model with nms
 
     def __init__(self, nc=80, anchors=(), nkpt=17, ch=(), inplace=True, dw_conv_kpt=False):  # detection layer
         super(IKeypoint, self).__init__()
@@ -253,21 +255,26 @@ class IKeypoint(nn.Module):
     def forward(self, x):
         # x = x.copy()  # for profiling
         z = []  # inference output
-        self.training |= self.export
         for i in range(self.nl):
             if self.nkpt is None or self.nkpt==0:
                 x[i] = self.im[i](self.m[i](self.ia[i](x[i])))  # conv
             else :
                 x[i] = torch.cat((self.im[i](self.m[i](self.ia[i](x[i]))), self.m_kpt[i](x[i])), axis=1)
-
+            
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
-            x_det = x[i][..., :6]
-            x_kpt = x[i][..., 6:]
+            if self.dynamic:
+                x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+                x_det = x[i][..., :6]
+                x_kpt = x[i][..., 6:]
+            else:
+                x[i] = x[i].view(int(bs), int(self.na), int(self.no), int(ny), int(nx)).permute(0, 1, 3, 4, 2).contiguous()
+                x_det, x_kpt = x[i].split((6, int(self.no)-6), -1)
+                
 
             if not self.training:  # inference
-                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+                
                 kpt_grid_x = self.grid[i][..., 0:1]
                 kpt_grid_y = self.grid[i][..., 1:2]
 
@@ -280,32 +287,58 @@ class IKeypoint(nn.Module):
                     xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i].view(1, self.na, 1, 1, 2) # wh
                     if self.nkpt != 0:
-                        x_kpt[..., 0::3] = (x_kpt[..., ::3] * 2. - 0.5 + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
+                        x_kpt[..., 0::3] = (x_kpt[..., 0::3] * 2. - 0.5 + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
                         x_kpt[..., 1::3] = (x_kpt[..., 1::3] * 2. - 0.5 + kpt_grid_y.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #x_kpt[..., 0::3] = (x_kpt[..., ::3] + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = (x_kpt[..., 1::3] + kpt_grid_y.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #print('=============')
-                        #print(self.anchor_grid[i].shape)
-                        #print(self.anchor_grid[i][...,0].unsqueeze(4).shape)
-                        #print(x_kpt[..., 0::3].shape)
-                        #x_kpt[..., 0::3] = ((x_kpt[..., 0::3].tanh() * 2.) ** 3 * self.anchor_grid[i][...,0].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_x.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = ((x_kpt[..., 1::3].tanh() * 2.) ** 3 * self.anchor_grid[i][...,1].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_y.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 0::3] = (((x_kpt[..., 0::3].sigmoid() * 4.) ** 2 - 8.) * self.anchor_grid[i][...,0].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_x.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = (((x_kpt[..., 1::3].sigmoid() * 4.) ** 2 - 8.) * self.anchor_grid[i][...,1].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_y.repeat(1,1,1,1,17) * self.stride[i]  # xy
                         x_kpt[..., 2::3] = x_kpt[..., 2::3].sigmoid()
-
-                    y = torch.cat((xy, wh, y[..., 4:], x_kpt), dim = -1)
+                        y = torch.cat((xy, wh, y[..., 4:], x_kpt), dim = -1)
+                    else:
+                        y = torch.cat((xy, wh, y[..., 4:]), dim = -1)
 
                 else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
-                    xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    if self.dynamic:
+                        anchor_grid = self.anchor_grid[i].view(1, -1, 1, 1, 2)
+                        xy, wh, conf = y[..., 0:2], y[..., 2:4], y[..., 4:]
+                        stride = self.stride[i]
+                    else:
+                        anchor_grid = self.anchor_grid[i].clone().view(1, -1, 1, 1, 2)
+                        xy, wh, conf = y.split((2, 2, self.nc+1), 4)
+                        stride = self.stride[i].item()
+                    
+                    xy = (xy * 2. - 0.5 + self.grid[i]) * stride  # xy
+                    wh = (wh * 2) ** 2 * anchor_grid  # wh
+
                     if self.nkpt != 0:
-                        y[..., 6:] = (y[..., 6:] * 2. - 0.5 + self.grid[i].repeat((1,1,1,1,self.nkpt))) * self.stride[i]  # xy
-                    y = torch.cat((xy, wh, y[..., 4:]), -1)
+                        kpt_x = x_kpt[...,0::3] 
+                        kpt_y = x_kpt[...,1::3] 
+                        kpt_c = x_kpt[...,2::3] 
+
+                        kpt_x = (kpt_x * 2. - 0.5 + kpt_grid_x.repeat(1,1,1,1,17)) * stride  # xy
+                        kpt_y = (kpt_y * 2. - 0.5 + kpt_grid_y.repeat(1,1,1,1,17)) * stride  # xy
+                        kpt_c = kpt_c.sigmoid()
+                        if self.dynamic:
+                            kpt = torch.stack((kpt_x,kpt_y,kpt_c),dim=-1).view(bs, self.na, ny, nx, 51)
+                        else:
+                            kpt = torch.stack((kpt_x,kpt_y,kpt_c),dim=-1).view(int(bs), int(self.na), int(ny), int(nx), 51)
+                        y = torch.cat((xy, wh, conf, kpt), -1)
+                    else:
+                        y = torch.cat((xy, wh, conf), -1)
 
                 z.append(y.view(bs, -1, self.no))
+        
+        if not self.training and self.end2end :
+            return torch.cat(z, 1)
 
-        return x if self.training else (torch.cat(z, 1), x)
+        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+
+    def forward_nodecode(self, x):
+        # forward without decode box and keypoints
+        for i in range(self.nl):
+            if self.nkpt is None or self.nkpt==0:
+                x[i] = self.im[i](self.m[i](self.ia[i](x[i])))  # conv
+            else :
+                x[i] = torch.cat((self.im[i](self.m[i](self.ia[i](x[i]))), self.m_kpt[i](x[i])), axis=1)
+        return x
+
 
     @staticmethod
     def _make_grid(nx=20, ny=20):

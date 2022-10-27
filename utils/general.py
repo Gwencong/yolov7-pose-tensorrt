@@ -474,6 +474,174 @@ def box_iou(box1, box2):
     return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
 
 
+def oks_iou(kpt_dts, kpt_gts, box_dts, box_gts, scores=None, gt_area=None, maxDets=100, xyxy=True,area_weight=0.6):
+    ''' https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/cocoeval.py#L192
+
+    kpt_dts: Mx51
+    kpt_gts: Nx34
+    box_dts: Mx4  
+    box_gts: Nx4
+    scores:  N
+    '''
+    device = kpt_dts.device
+    sigmas = torch.tensor([.26, .25, .25, .35, .35, .79, .79, .72, .72, .62, .62, 1.07, 1.07,.87, .87, .89, .89]) / 10.0
+    sigmas = sigmas.to(device)
+    vars = (sigmas * 2)**2
+    k = len(sigmas)
+    if scores is not None:
+        inds = (-scores).argsort()
+        kpt_dts = kpt_dts[inds,:]
+        box_dts = box_dts[inds,:]
+    if maxDets is not None and len(kpt_dts) > maxDets:
+        kpt_dts = kpt_dts[0:maxDets]
+        box_dts = box_dts[0:maxDets]
+    
+    ious = torch.zeros((len(kpt_dts), len(kpt_gts))).to(device)
+    if len(kpt_gts) == 0 or len(kpt_dts) == 0:
+        return ious
+
+    # compute oks between each detection and ground truth object
+    for j in range(kpt_gts.shape[0]):
+        # create bounds for ignore regions(double the gt bbox)
+        g = kpt_gts[j]
+        xg = g[0::2]; yg = g[1::2]; vg = torch.bitwise_and(xg!=0,yg!=0)
+        k1 = torch.count_nonzero(vg > 0)
+        bb = box_gts[j]
+        if xyxy:
+            bb[[2,3]] = bb[[2,3]] - bb[[0,1]]
+        x0 = bb[0] - bb[2]; x1 = bb[0] + bb[2] * 2
+        y0 = bb[1] - bb[3]; y1 = bb[1] + bb[3] * 2
+        if gt_area is None:
+            area = bb[2]*bb[3]*area_weight
+        else:
+            area = gt_area[j]
+        for i in range(kpt_dts.shape[0]):
+            d = kpt_dts[i]
+            xd = d[0::3]; yd = d[1::3]
+            if k1>0:
+                # measure the per-keypoint distance if keypoints visible
+                dx = xd - xg
+                dy = yd - yg
+            else:
+                # measure minimum distance to keypoints in (x0,y0) & (x1,y1)
+                z = torch.zeros((k))
+                dx = torch.max(z, x0-xd)+torch.max(z, xd-x1)
+                dy = torch.max(z, y0-yd)+torch.max(z, yd-y1)
+            e = (dx**2 + dy**2) / vars / (area+1e-9) / 2
+            if k1 > 0:
+                e=e[vg > 0]
+            ious[i, j] = torch.sum(torch.exp(-e)) / e.shape[0]
+    return ious
+
+
+def oks_iou_fast(kpt_dts, kpt_gts, box_dts, box_gts, scores=None, gt_area=None, maxDets=100,xyxy=True,area_weight=0.6):
+    '''去掉for循环, 矩阵加速运算
+    kpt_dts: Mx51
+    kpt_gts: Nx34
+    box_dts: Mx4  
+    box_gts: Nx4
+    scores:  N
+    '''
+    device = kpt_dts.device
+    sigmas = torch.tensor([.26, .25, .25, .35, .35, .79, .79, .72, .72, .62, .62, 1.07, 1.07,.87, .87, .89, .89]) / 10.0
+    sigmas = sigmas.to(device)
+    vars = (sigmas * 2)**2
+    
+    k = len(sigmas)
+    if scores is not None:
+        inds = (-scores).argsort()
+        kpt_dts = kpt_dts[inds,:]
+        box_dts = box_dts[inds,:]
+    if maxDets is not None and len(kpt_dts) > maxDets:
+        kpt_dts = kpt_dts[0:maxDets]
+        box_dts = box_dts[0:maxDets]
+    vars = vars.reshape(1,1,-1).expand(len(kpt_dts), len(kpt_gts),-1)
+    
+    ious = torch.zeros((len(kpt_dts), len(kpt_gts))).to(device)
+    if len(kpt_gts) == 0 or len(kpt_dts) == 0:
+        return ious
+    
+    # compute oks between each detection and ground truth object
+    xg = kpt_gts[:,0::2]; yg = kpt_gts[:,1::2]; vg = torch.bitwise_and(xg!=0,yg!=0) # Nx17
+    k1 = torch.count_nonzero(vg > 0,dim=1)  # N
+    bb = box_gts
+    if xyxy:
+        bb[:,[2,3]] = bb[:,[2,3]] - bb[:,[0,1]]
+    # create bounds for ignore regions(double the gt bbox)
+    x0 = bb[:,0] - bb[:,2]; x1 = bb[:,0] + bb[:,2] * 2  # N
+    y0 = bb[:,1] - bb[:,3]; y1 = bb[:,1] + bb[:,3] * 2  # N
+    if gt_area is None:
+        area = bb[:,2]*bb[:,3]*area_weight  # N
+    else: 
+        area = gt_area                      # N
+    area = area.reshape(1,-1,1).expand(len(kpt_dts), len(kpt_gts),k) # MxNx17
+    
+    d = kpt_dts
+    xd = d[:,0::3]; yd = d[:,1::3]  # Mx17
+    
+    # measure the per-keypoint distance if keypoints visible
+    dx1 = xd[:,None] - xg[None,:]    # MxNx17
+    dy1 = yd[:,None] - yg[None,:]    # MxNx17
+    
+    # measure minimum distance to keypoints in (x0,y0) & (x1,y1)
+    # 如果所有关键点都不可见（遮挡），那么所有关键点都应预测在gt box内，否者进行惩罚
+    z = torch.zeros((len(kpt_dts), len(kpt_gts),k)).to(device)
+    dx2 = torch.max(z, x0[None,:,None]-xd[:,None])+torch.max(z, xd[:,None]-x1[None,:,None])
+    dy2 = torch.max(z, y0[None,:,None]-yd[:,None])+torch.max(z, yd[:,None]-y1[None,:,None])
+
+    visible_num = k1[None,:,None].repeat(xd.shape[0],1,xd.shape[-1])
+    dx = torch.where(visible_num>0,dx1,dx2)
+    dy = torch.where(visible_num>0,dy1,dy2)
+
+    e = (dx**2 + dy**2) / vars / (area+1e-9) / 2        #  MxNx17
+    mask = vg[None,:].repeat(xd.shape[0],1,1).float()   #  MxNx17
+    mask = torch.where(torch.all(mask==0,dim=-1,keepdim=True),torch.ones_like(mask,device=device),mask)
+    nums = torch.sum(mask,dim=-1)                   #  MxN
+    sum_e = torch.sum(torch.exp(-e)*mask,dim=-1)    #  MxN
+    ious = sum_e/nums                               #  MxN
+    ious = torch.where(nums>0,ious,torch.zeros_like(ious,device=device))
+    return ious
+
+
+def oks_iou_one2one(g, d, a_g, a_d, sigmas=None, vis_thr=None):
+    """Calculate oks ious.
+    Args:
+        g: Ground truth keypoints. [N,51]
+        d: Detected keypoints.     [N,51]
+        a_g: Area of the ground truth object.   [N,1]
+        a_d: Area of the detected object.       [N,1]
+        sigmas: standard deviation of keypoint labelling.
+        vis_thr: threshold of the keypoint visibility.
+    Returns:
+        list: The oks ious.
+    """
+    if sigmas is None:
+        sigmas = torch.Tensor([
+            .26, .25, .25, .35, .35, .79, .79, .72, .72, .62, .62, 1.07, 1.07,
+            .87, .87, .89, .89
+        ]) / 10.0
+    vars = ((sigmas * 2)**2).reshape(1,-1).to(g.device)
+    xg = g[:,0::3]  # [N,17]
+    yg = g[:,1::3]
+    vg = g[:,2::3]
+    
+    xd = d[:, 0::3] # [N,17]
+    yd = d[:, 1::3]
+    vd = d[:, 2::3]
+    dx = xd - xg
+    dy = yd - yg
+    e = (dx**2 + dy**2) / vars / ((a_g*0.6) / 2 + 1e-9) / 2
+    if vis_thr is not None:
+        mask = torch.bitwise_and(vg > vis_thr, vd > vis_thr).float()
+        mask = torch.where(torch.all(mask==0,dim=-1,keepdim=True),torch.ones_like(mask),mask)
+    else:
+        mask = torch.ones_like(mask.shape)
+    num_vis = torch.sum(mask,-1)
+    ious = torch.where(num_vis>0,torch.sum(torch.exp(-e)*mask,-1) / num_vis,torch.zeros_like(num_vis))
+    assert torch.bitwise_and(ious<=1,ious>=0).sum() == len(ious),f'value out of range [0,1]'
+    return ious
+
+
 def wh_iou(wh1, wh2):
     # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
     wh1 = wh1[:, None]  # [N,1,2]
