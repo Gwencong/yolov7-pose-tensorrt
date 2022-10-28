@@ -535,7 +535,7 @@ def oks_iou(kpt_dts, kpt_gts, box_dts, box_gts, scores=None, gt_area=None, maxDe
 
 
 def oks_iou_fast(kpt_dts, kpt_gts, box_dts, box_gts, scores=None, gt_area=None, maxDets=100,xyxy=True,area_weight=0.6):
-    '''去掉for循环, 矩阵加速运算
+    '''The for loop is changed to matrix multiplication to speed up the calculation
     kpt_dts: Mx51
     kpt_gts: Nx34
     box_dts: Mx4  
@@ -584,7 +584,8 @@ def oks_iou_fast(kpt_dts, kpt_gts, box_dts, box_gts, scores=None, gt_area=None, 
     dy1 = yd[:,None] - yg[None,:]    # MxNx17
     
     # measure minimum distance to keypoints in (x0,y0) & (x1,y1)
-    # 如果所有关键点都不可见（遮挡），那么所有关键点都应预测在gt box内，否者进行惩罚
+    # If all keypoints are not visible (occluded), then all keypoints should 
+    # be predicted inside the gt box, otherwise penalize
     z = torch.zeros((len(kpt_dts), len(kpt_gts),k)).to(device)
     dx2 = torch.max(z, x0[None,:,None]-xd[:,None])+torch.max(z, xd[:,None]-x1[None,:,None])
     dy2 = torch.max(z, y0[None,:,None]-yd[:,None])+torch.max(z, yd[:,None]-y1[None,:,None])
