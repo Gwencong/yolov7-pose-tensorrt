@@ -76,6 +76,8 @@ python detect_multi_backend.py \
 ```
 
 ## Testing
+[yolov7-w6-pose.pt](https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-w6-pose.pt)  
+
 &emsp;The official YOLOv7-pose and YOLO-Pose code just calculate the detection mAP in test.py, if you want to calculate the keypoint mAP, you need to use the COCO API, but its oks_iou calculation is very slow, calculating keypoints mAP in validation during the process of training will slow down the training process, so i implement the calculation of oks_iou with matrix calculation in this repo, which speeds up the calculation of oks_iou when calculate keypoints mAP.   
 &emsp;Note that the area calculation in the oks_iou implementation uses the ground truth box width and height product instead of the ground truth area of each object which has been used in COCO API, because custom datasets often do not label the area of each object. See more detail in the [code](https://github.com/Gwencong/yolov7-pose-tensorrt/blob/main/utils/general.py#L537-L603).  
 &emsp;When testing the key point mAP, the OKS area is set to `0.6 * ground truth box area`, so the keypoints mAP displayed by the terminal may be higher than the mAP calculated using the COCO API
